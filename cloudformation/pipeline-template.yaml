@@ -23,7 +23,7 @@ Parameters:
     NoEcho: true
 
 Resources:
-  # S3 Bucket for Pipeline Artifacts (REQUIRED)
+  # S3 Bucket for Pipeline Artifacts
   ArtifactsBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -40,44 +40,7 @@ Resources:
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
 
-  # KMS Key for Artifact Encryption (Optional but recommended)
-  ArtifactsKmsKey:
-    Type: AWS::KMS::Key
-    Properties:
-      Description: KMS key for CodePipeline artifacts encryption
-      KeyPolicy:
-        Version: '2012-10-17'
-        Statement:
-          - Sid: Enable IAM User Permissions
-            Effect: Allow
-            Principal:
-              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
-            Action: 'kms:*'
-            Resource: '*'
-          - Sid: Allow CodePipeline
-            Effect: Allow
-            Principal:
-              Service: codepipeline.amazonaws.com
-            Action:
-              - 'kms:Encrypt'
-              - 'kms:Decrypt'
-              - 'kms:ReEncrypt*'
-              - 'kms:GenerateDataKey*'
-              - 'kms:DescribeKey'
-            Resource: '*'
-          - Sid: Allow CodeBuild
-            Effect: Allow
-            Principal:
-              Service: codebuild.amazonaws.com
-            Action:
-              - 'kms:Encrypt'
-              - 'kms:Decrypt'
-              - 'kms:ReEncrypt*'
-              - 'kms:GenerateDataKey*'
-              - 'kms:DescribeKey'
-            Resource: '*'
-
-  # CodeBuild Project for Terraform
+  # CodeBuild Project for Terraform - NO BuildSpec here (uses external file)
   TerraformBuildProject:
     Type: AWS::CodeBuild::Project
     Properties:
@@ -85,57 +48,14 @@ Resources:
       Description: 'CodeBuild project for Terraform deployment'
       ServiceRole: !GetAtt CodeBuildRole.Arn
       
+      # CodeBuild will automatically use the buildspec.yml from source
       Source:
         Type: CODEPIPELINE
-        BuildSpec: |
-          version: 0.2
-          phases:
-            install:
-              runtime-versions:
-                python: 3.8
-              commands:
-                - echo "Installing Terraform..."
-                - TERRAFORM_VERSION="1.5.7"
-                - wget https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip
-                - unzip terraform_${TERRAFORM_VERSION}_linux_amd64.zip
-                - mv terraform /usr/local/bin/
-                - terraform --version
-                - echo "Installing AWS CLI..."
-                - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-                - unzip awscliv2.zip
-                - ./aws/install
-                - aws --version
-                
-            pre_build:
-              commands:
-                - echo "Changing to infrastructure directory..."
-                - cd infrastructure
-                - echo "Terraform initialization..."
-                - terraform init -input=false
-                
-            build:
-              commands:
-                - echo "Terraform plan..."
-                - terraform plan -out=tfplan -input=false
-                
-            post_build:
-              commands:
-                - echo "Terraform apply..."
-                - terraform apply -auto-approve -input=false tfplan
-                - echo "Deployment completed successfully!"
-                
-          artifacts:
-            files:
-              - '**/*'
-            base-directory: infrastructure
-          
-          env:
-            variables:
-              AWS_DEFAULT_REGION: !Ref AWS::Region
-              
+        BuildSpec: ""  # Empty - uses external buildspec.yml
+      
       Artifacts:
         Type: CODEPIPELINE
-        
+      
       Environment:
         Type: LINUX_CONTAINER
         ComputeType: BUILD_GENERAL1_SMALL
@@ -144,24 +64,20 @@ Resources:
         EnvironmentVariables:
           - Name: AWS_DEFAULT_REGION
             Value: !Ref AWS::Region
-          - Name: ENVIRONMENT
-            Value: "pipeline"
+          - Name: TF_IN_AUTOMATION
+            Value: "true"
 
-  # CodePipeline - MAIN FIX: Added required ArtifactStore
+  # CodePipeline
   TerraformPipeline:
     Type: AWS::CodePipeline::Pipeline
     Properties:
       Name: !Sub 'terraform-s3-locking-pipeline'
       RoleArn: !GetAtt CodePipelineRole.Arn
       
-      # === REQUIRED ARTIFACT STORE CONFIGURATION ===
+      # Required ArtifactStore
       ArtifactStore:
         Type: S3
         Location: !Ref ArtifactsBucket
-        EncryptionKey:
-          Type: KMS
-          Id: !Ref ArtifactsKmsKey
-      # =============================================
       
       Stages:
         # Stage 1: Source from GitHub
@@ -196,8 +112,6 @@ Resources:
                 ProjectName: !Ref TerraformBuildProject
               InputArtifacts:
                 - Name: SourceCode
-              OutputArtifacts:
-                - Name: DeploymentOutput
               RunOrder: 1
 
   # IAM Role for CodePipeline
@@ -211,10 +125,8 @@ Resources:
             Principal:
               Service: codepipeline.amazonaws.com
             Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AWSCodePipeline_FullAccess
       Policies:
-        - PolicyName: S3ArtifactsAccess
+        - PolicyName: CodePipelinePermissions
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
@@ -230,12 +142,10 @@ Resources:
                   - !Sub '${ArtifactsBucket.Arn}/*'
               - Effect: Allow
                 Action:
-                  - kms:Encrypt
-                  - kms:Decrypt
-                  - kms:ReEncrypt*
-                  - kms:GenerateDataKey*
-                  - kms:DescribeKey
-                Resource: !GetAtt ArtifactsKmsKey.Arn
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                  - codebuild:StopBuild
+                Resource: !GetAtt TerraformBuildProject.Arn
 
   # IAM Role for CodeBuild
   CodeBuildRole:
@@ -248,24 +158,20 @@ Resources:
             Principal:
               Service: codebuild.amazonaws.com
             Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/AdministratorAccess
       Policies:
-        - PolicyName: CloudFormationAccess
+        - PolicyName: CodeBuildPermissions
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
-                  - cloudformation:*
-                Resource: '*'
-              - Effect: Allow
-                Action:
                   - s3:*
-                Resource: '*'
-              - Effect: Allow
-                Action:
-                  - kms:*
+                  - ec2:*
+                  - vpc:*
+                  - iam:*
+                  - dynamodb:*
+                  - cloudformation:*
+                  - logs:*
                 Resource: '*'
 
 Outputs:
