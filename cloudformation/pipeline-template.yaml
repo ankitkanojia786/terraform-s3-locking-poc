@@ -1,30 +1,243 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Terraform Pipeline with S3 Native Locking POC
+Description: 'CodePipeline for Terraform S3 State Locking POC'
 
 Parameters:
+  GitHubOwner:
+    Type: String
+    Description: GitHub repository owner/username
+    Default: "ankitkanojia786"
+    
   GitHubRepo:
     Type: String
-    Default: ankitkanojia786/terraform-s3-locking-poc
+    Description: GitHub repository name
+    Default: "TerraformApplyProject"
+    
   GitHubBranch:
     Type: String
     Default: main
-  GitHubToken:
+    Description: GitHub branch
+    
+  GitHubOAuthToken:
     Type: String
+    Description: GitHub OAuth token
     NoEcho: true
 
 Resources:
-  TerraformStateBucket:
+  # S3 Bucket for Pipeline Artifacts (REQUIRED)
+  ArtifactsBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: !Sub "terraform-state-${AWS::AccountId}-${AWS::Region}"
+      BucketName: !Sub 'terraform-artifacts-${AWS::AccountId}-${AWS::Region}'
       VersioningConfiguration:
         Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
 
-  ArtifactStoreBucket:
-    Type: AWS::S3::Bucket
+  # KMS Key for Artifact Encryption (Optional but recommended)
+  ArtifactsKmsKey:
+    Type: AWS::KMS::Key
     Properties:
-      BucketName: !Sub "codepipeline-artifacts-${AWS::AccountId}-${AWS::Region}"
+      Description: KMS key for CodePipeline artifacts encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow CodePipeline
+            Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+            Resource: '*'
+          - Sid: Allow CodeBuild
+            Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:DescribeKey'
+            Resource: '*'
 
+  # CodeBuild Project for Terraform
+  TerraformBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub 'terraform-build-${AWS::StackName}'
+      Description: 'CodeBuild project for Terraform deployment'
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                python: 3.8
+              commands:
+                - echo "Installing Terraform..."
+                - TERRAFORM_VERSION="1.5.7"
+                - wget https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+                - unzip terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+                - mv terraform /usr/local/bin/
+                - terraform --version
+                - echo "Installing AWS CLI..."
+                - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                - unzip awscliv2.zip
+                - ./aws/install
+                - aws --version
+                
+            pre_build:
+              commands:
+                - echo "Changing to infrastructure directory..."
+                - cd infrastructure
+                - echo "Terraform initialization..."
+                - terraform init -input=false
+                
+            build:
+              commands:
+                - echo "Terraform plan..."
+                - terraform plan -out=tfplan -input=false
+                
+            post_build:
+              commands:
+                - echo "Terraform apply..."
+                - terraform apply -auto-approve -input=false tfplan
+                - echo "Deployment completed successfully!"
+                
+          artifacts:
+            files:
+              - '**/*'
+            base-directory: infrastructure
+          
+          env:
+            variables:
+              AWS_DEFAULT_REGION: !Ref AWS::Region
+              
+      Artifacts:
+        Type: CODEPIPELINE
+        
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:3.0
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: ENVIRONMENT
+            Value: "pipeline"
+
+  # CodePipeline - MAIN FIX: Added required ArtifactStore
+  TerraformPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub 'terraform-s3-locking-pipeline'
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      
+      # === REQUIRED ARTIFACT STORE CONFIGURATION ===
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactsBucket
+        EncryptionKey:
+          Type: KMS
+          Id: !Ref ArtifactsKmsKey
+      # =============================================
+      
+      Stages:
+        # Stage 1: Source from GitHub
+        - Name: Source
+          Actions:
+            - Name: GitHub-Source
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Provider: GitHub
+                Version: '1'
+              Configuration:
+                Owner: !Ref GitHubOwner
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubOAuthToken
+                PollForSourceChanges: true
+              OutputArtifacts:
+                - Name: SourceCode
+              RunOrder: 1
+
+        # Stage 2: Terraform Build and Deploy
+        - Name: Deploy
+          Actions:
+            - Name: Terraform-Deploy
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref TerraformBuildProject
+              InputArtifacts:
+                - Name: SourceCode
+              OutputArtifacts:
+                - Name: DeploymentOutput
+              RunOrder: 1
+
+  # IAM Role for CodePipeline
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodePipeline_FullAccess
+      Policies:
+        - PolicyName: S3ArtifactsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource:
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub '${ArtifactsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Resource: !GetAtt ArtifactsKmsKey.Arn
+
+  # IAM Role for CodeBuild
   CodeBuildRole:
     Type: AWS::IAM::Role
     Properties:
@@ -37,151 +250,37 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AdministratorAccess
-
-  TerraformPlanProject:
-    Type: AWS::CodeBuild::Project
-    Properties:
-      Name: terraform-plan-poc
-      ServiceRole: !GetAtt CodeBuildRole.Arn
-      Source:
-        Type: CODEPIPELINE
-        BuildSpec: |
-          version: 0.2
-          phases:
-            install:
-              commands:
-                - wget -q https://releases.hashicorp.com/terraform/1.5.7/terraform_1.5.7_linux_amd64.zip
-                - unzip -q terraform_1.5.7_linux_amd64.zip
-                - mv terraform /usr/local/bin/
-            pre_build:
-              commands:
-                - cd infrastructure
-                - echo 'terraform { backend "s3" { bucket = "'${TF_STATE_BUCKET}'", key = "terraform.tfstate", region = "'${AWS_REGION}'", force_path_style = true } }' > backend.tf
-                - terraform init
-            build:
-              commands:
-                - terraform plan -out=tfplan -var="environment=poc"
-      Environment:
-        Type: LINUX_CONTAINER
-        ComputeType: BUILD_GENERAL1_MEDIUM
-        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
-        EnvironmentVariables:
-          - Name: TF_STATE_BUCKET
-            Value: !Ref TerraformStateBucket
-
-  TerraformApplyProject:
-    Type: AWS::CodeBuild::Project
-    Properties:
-      Name: terraform-apply-poc
-      ServiceRole: !GetAtt CodeBuildRole.Arn
-      Source:
-        Type: CODEPIPELINE
-        BuildSpec: |
-          version: 0.2
-          phases:
-            install:
-              commands:
-                - wget -q https://releases.hashicorp.com/terraform/1.5.7/terraform_1.5.7_linux_amd64.zip
-                - unzip -q terraform_1.5.7_linux_amd64.zip
-                - mv terraform /usr/local/bin/
-            pre_build:
-              commands:
-                - cd infrastructure
-                - echo 'terraform { backend "s3" { bucket = "'${TF_STATE_BUCKET}'", key = "terraform.tfstate", region = "'${AWS_REGION}'", force_path_style = true } }' > backend.tf
-                - terraform init
-            build:
-              commands:
-                - terraform apply -auto-approve tfplan
-      Environment:
-        Type: LINUX_CONTAINER
-        ComputeType: BUILD_GENERAL1_MEDIUM
-        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
-        EnvironmentVariables:
-          - Name: TF_STATE_BUCKET
-            Value: !Ref TerraformStateBucket
-
-  CodePipelineRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: codepipeline.amazonaws.com
-            Action: sts:AssumeRole
       Policies:
-        - PolicyName: CodePipelineAccess
+        - PolicyName: CloudFormationAccess
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
-                  - codebuild:*
+                  - cloudformation:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
                   - s3:*
-                Resource: "*"
-
-  TerraformPipeline:
-    Type: AWS::CodePipeline::Pipeline
-    Properties:
-      Name: terraform-s3-locking-poc
-      RoleArn: !GetAtt CodePipelineRole.Arn
-      ArtifactStore:
-        Type: S3
-        Location: !Ref ArtifactStoreBucket
-      Stages:
-        - Name: Source
-          Actions:
-            - Name: GitHub-Source
-              ActionTypeId:
-                Category: Source
-                Owner: ThirdParty
-                Version: 1
-                Provider: GitHub
-              Configuration:
-                Owner: ankitkanojia786
-                Repo: terraform-s3-locking-poc
-                Branch: main
-                OAuthToken: !Ref GitHubToken
-              OutputArtifacts:
-                - Name: SourceCode
-        - Name: Plan
-          Actions:
-            - Name: Terraform-Plan
-              ActionTypeId:
-                Category: Build
-                Owner: AWS
-                Version: 1
-                Provider: CodeBuild
-              Configuration:
-                ProjectName: !Ref TerraformPlanProject
-              InputArtifacts:
-                - Name: SourceCode
-        - Name: Approval
-          Actions:
-            - Name: Manual-Approval
-              ActionTypeId:
-                Category: Approval
-                Owner: AWS
-                Version: 1
-                Provider: Manual
-              Configuration:
-                CustomData: Approve deployment
-        - Name: Apply
-          Actions:
-            - Name: Terraform-Apply
-              ActionTypeId:
-                Category: Build
-                Owner: AWS
-                Version: 1
-                Provider: CodeBuild
-              Configuration:
-                ProjectName: !Ref TerraformApplyProject
-              InputArtifacts:
-                - Name: SourceCode
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - kms:*
+                Resource: '*'
 
 Outputs:
-  StateBucketName:
-    Value: !Ref TerraformStateBucket
   PipelineName:
+    Description: Name of the created CodePipeline
     Value: !Ref TerraformPipeline
+    
+  ArtifactsBucketName:
+    Description: S3 bucket for pipeline artifacts
+    Value: !Ref ArtifactsBucket
+    
+  CodeBuildProject:
+    Description: CodeBuild project name
+    Value: !Ref TerraformBuildProject
+    
+  PipelineUrl:
+    Description: URL to access the pipeline in AWS Console
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${TerraformPipeline}/view?region=${AWS::Region}'
