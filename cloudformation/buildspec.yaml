@@ -1,0 +1,21 @@
+version: 0.2
+phases:
+  install:
+    commands:
+      - yum update -y
+      - yum install -y unzip
+      - TERRAFORM_VERSION="1.5.7"
+      - wget https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+      - unzip terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+      - mv terraform /usr/local/bin/
+      - terraform --version
+  pre_build:
+    commands:
+      - cd infrastructure
+      - terraform init
+  build:
+    commands:
+      - terraform plan -out=tfplan
+  post_build:
+    commands:
+      - terraform apply -auto-approve tfplan
