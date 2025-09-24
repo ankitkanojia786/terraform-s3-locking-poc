@@ -1,0 +1,324 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Terraform Pipeline with S3 Native Locking POC
+
+Parameters:
+  GitHubRepo:
+    Type: String
+    Description: Your GitHub repository (format: username/repo-name)
+    Default: ankitkanojia786/terraform-s3-locking-poc
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: GitHub branch to monitor
+  GitHubToken:
+    Type: String
+    NoEcho: true
+    Description: GitHub OAuth token for webhook integration
+
+Resources:
+  # S3 Bucket for Terraform State Storage
+  TerraformStateBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "terraform-state-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # S3 Bucket for CodePipeline Artifacts
+  ArtifactStoreBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "codepipeline-artifacts-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+
+  # IAM Role for CodeBuild
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !GetAtt TerraformStateBucket.Arn
+                  - !Sub "${TerraformStateBucket.Arn}/*"
+                  - !GetAtt ArtifactStoreBucket.Arn
+                  - !Sub "${ArtifactStoreBucket.Arn}/*"
+
+  # CodeBuild Project for Terraform Plan
+  TerraformPlanProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "terraform-plan-${AWS::StackName}"
+      Description: "Terraform plan stage with S3 native locking"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - echo "=== Installing Terraform ==="
+                - TERRAFORM_VERSION="1.5.7"
+                - wget https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+                - unzip terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+                - mv terraform /usr/local/bin/
+                - terraform version
+            pre_build:
+              commands:
+                - echo "=== Configuring S3 Backend for Native Locking ==="
+                - echo "State Bucket: ${TF_STATE_BUCKET}"
+                - echo "AWS Region: ${AWS_REGION}"
+                - cd infrastructure
+                - |
+                  # Create backend configuration for S3 native locking
+                  cat > backend.tf << EOF
+                  terraform {
+                    backend "s3" {
+                      bucket = "${TF_STATE_BUCKET}"
+                      key    = "terraform.tfstate"
+                      region = "${AWS_REGION}"
+                      # S3 Native Locking Configuration
+                      force_path_style = true
+                    }
+                  }
+                  EOF
+                - echo "Backend configuration created:"
+                - cat backend.tf
+                - echo "=== Initializing Terraform ==="
+                - terraform init
+            build:
+              commands:
+                - echo "=== Running Terraform Plan ==="
+                - terraform plan -out=tfplan -var="environment=${ENVIRONMENT}" -detailed-exitcode
+                - echo "Plan completed successfully"
+          artifacts:
+            files:
+              - infrastructure/tfplan
+              - infrastructure/backend.tf
+            name: plan-artifact
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+        EnvironmentVariables:
+          - Name: TF_STATE_BUCKET
+            Value: !Ref TerraformStateBucket
+          - Name: ENVIRONMENT
+            Value: poc
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+
+  # CodeBuild Project for Terraform Apply
+  TerraformApplyProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "terraform-apply-${AWS::StackName}"
+      Description: "Terraform apply stage with S3 native locking"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - echo "=== Installing Terraform ==="
+                - TERRAFORM_VERSION="1.5.7"
+                - wget https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+                - unzip terraform_${TERRAFORM_VERSION}_linux_amd64.zip
+                - mv terraform /usr/local/bin/
+                - terraform version
+            pre_build:
+              commands:
+                - echo "=== Configuring S3 Backend for Native Locking ==="
+                - echo "State Bucket: ${TF_STATE_BUCKET}"
+                - cd infrastructure
+                - |
+                  # Create backend configuration for S3 native locking
+                  cat > backend.tf << EOF
+                  terraform {
+                    backend "s3" {
+                      bucket = "${TF_STATE_BUCKET}"
+                      key    = "terraform.tfstate"
+                      region = "${AWS_REGION}"
+                      # S3 Native Locking Configuration
+                      force_path_style = true
+                    }
+                  }
+                  EOF
+                - echo "=== Initializing Terraform ==="
+                - terraform init
+            build:
+              commands:
+                - echo "=== Running Terraform Apply ==="
+                - terraform apply -input=false -auto-approve tfplan
+                - echo "=== Apply Completed ==="
+                - echo "=== Resources Created ==="
+                - terraform output
+          artifacts:
+            files:
+              - infrastructure/terraform.tfstate
+            name: apply-artifact
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+        EnvironmentVariables:
+          - Name: TF_STATE_BUCKET
+            Value: !Ref TerraformStateBucket
+          - Name: ENVIRONMENT
+            Value: poc
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+
+  # IAM Role for CodePipeline
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                  - codebuild:BatchGetProjects
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # CodePipeline
+  TerraformPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "terraform-s3-locking-${AWS::StackName}"
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactStoreBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHub-Source
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 1
+                Provider: GitHub
+              Configuration:
+                Owner: ankitkanojia786
+                Repo: terraform-s3-locking-poc
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubToken
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceCode
+              RunOrder: 1
+
+        - Name: Plan
+          Actions:
+            - Name: Terraform-Plan
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref TerraformPlanProject
+              InputArtifacts:
+                - Name: SourceCode
+              OutputArtifacts:
+                - Name: PlanArtifact
+              RunOrder: 1
+
+        - Name: Manual-Approval
+          Actions:
+            - Name: Approve-Deployment
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Version: 1
+                Provider: Manual
+              Configuration:
+                CustomData: "Please review the Terraform plan and approve for deployment"
+                NotificationArn: !Ref ApprovalNotificationTopic
+              RunOrder: 1
+
+        - Name: Apply
+          Actions:
+            - Name: Terraform-Apply
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref TerraformApplyProject
+              InputArtifacts:
+                - Name: SourceCode
+                - Name: PlanArtifact
+              OutputArtifacts:
+                - Name: ApplyArtifact
+              RunOrder: 1
+
+  # SNS Topic for Manual Approval Notifications
+  ApprovalNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "terraform-approval-${AWS::StackName}"
+
+Outputs:
+  StateBucketName:
+    Description: Name of the S3 bucket for Terraform state storage
+    Value: !Ref TerraformStateBucket
+  PipelineName:
+    Description: Name of the CodePipeline
+    Value: !Ref TerraformPipeline
+  PlanProjectName:
+    Description: Name of the Terraform Plan CodeBuild project
+    Value: !Ref TerraformPlanProject
+  ApplyProjectName:
+    Description: Name of the Terraform Apply CodeBuild project
+    Value: !Ref TerraformApplyProject
+  GitHubWebhook:
+    Description: GitHub repository webhook URL
+    Value: !Sub "https://console.aws.amazon.com/codesuite/codepipeline/pipelines/${TerraformPipeline}/view"

@@ -1,0 +1,20 @@
+# Local Terraform files
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform/
+terraform.tfstate.backup
+
+# Build artifacts
+tfplan
+plan-artifact/
+apply-artifact/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
